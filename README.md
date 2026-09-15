@@ -1,6 +1,10 @@
+<div align="center">
+
 # cachebeat 🫀
 
 **Stop paying full price to say "I'm back" to your own Claude Code session.**
+
+</div>
 
 A tiny Claude Code skill that keeps your prompt cache warm while a session sits idle — so your
 next message reads the conversation from cache instead of re-billing it from scratch. Anthropic
