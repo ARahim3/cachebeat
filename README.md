@@ -42,25 +42,25 @@ biggest line in your bill — or the reason you hit your usage limit by mid-week
 
 ## The fix
 
-`/cachebeat` arms a single silent background watcher inside your session. **It's an inactivity
-timer, not a metronome**: it fires only when the session has been truly silent for N minutes — any
-message, reply, or answered background event already refreshed the cache and resets the clock.
-On firing, Claude wakes, quietly re-arms the watcher, and the cache TTL restarts.
+`/cachebeat` arms a silent background watcher inside your session. **It's an inactivity timer, not a
+metronome**: it fires only when the session has been truly silent for N minutes — any message, reply,
+or answered background event already refreshed the cache and resets the clock. On firing, Claude
+wakes, answers with a single `.`, and the cache TTL restarts. The next timer starts by itself.
 
-**Break-even math:** going cold once costs as much as **ten** heartbeats. Come back to the
-session even once and the heartbeat has paid for itself many times over — and the bigger the
-session, the bigger the absolute savings (the 10× ratio is flat; the token count isn't).
+**Break-even math:** going cold once costs as much as **ten** heartbeats. Come back to the session
+even once and the heartbeat has paid for itself many times over — and the bigger the session, the
+bigger the absolute savings (the 10× ratio is flat; the token count isn't).
 
-It also kills itself after a deadline (default 8 h), so an abandoned session doesn't drip-bill
-forever.
+It also kills itself after a deadline (default 8 h), so an abandoned session doesn't drip-bill forever.
 
-> **Note (Sept 2026):** cachebeat used to run as one *persistent* background monitor. A Claude Code
-> update capped monitors at 30 minutes with no persistent option — which would force a wake-up every
-> ~28 min, idle or not. cachebeat now runs as a **background shell task** instead, which has no such
-> cap: it stays silent for the full idle threshold (50 min by default), exits to deliver the beat,
-> and Claude re-arms it. Same inactivity timer, different plumbing. **Upgrading?** The watcher now
-> lives in a second file — copy `beat.sh` next to `SKILL.md` (see [Install](#install)). Details in
-> [How it works](#how-it-works).
+> **Note (Oct 2026):** Claude Code 2.1.285 put a lifetime on background shell commands (30 min by
+> default, 2 h at most) and tells Claude not to restart one that hit the 2 h cap. The previous
+> cachebeat ran as exactly such a command, so it was killed before its first 50-minute beat (or at
+> 2 h on a busy session) and never came back ([#1](https://github.com/ARahim3/cachebeat/issues/1)).
+> cachebeat now runs as an **`asyncRewake` Stop hook** declared in the skill itself: no lifetime cap,
+> no re-arm tool call, no permission prompt, and one request per beat instead of two. **Upgrading?**
+> Copy both files again (see [Install](#install)), then run `/cachebeat` once in each session you want
+> covered. A session still running the old instructions stops at its next re-arm instead of looping.
 
 ## Install
 
@@ -73,24 +73,13 @@ cp SKILL.md beat.sh ~/.claude/skills/cachebeat/
 
 Or project-level: copy both files into `<your-project>/.claude/skills/cachebeat/`.
 
-That's the whole setup — two small files: the skill, and the watcher script it runs. Then in any
-Claude Code session, type `/cachebeat` and you're done. (It just needs a Claude Code that runs
-background tasks, which is the default.)
+That's the whole setup — two small files: the skill, and the watcher script its hook runs. Then in any
+Claude Code session, type `/cachebeat` and you're done. There is nothing to approve: hooks don't ask
+for permission, and Claude never runs a command for it.
 
-**One thing to do on first use:** unless you run in auto mode or with permissions bypassed, Claude
-Code will ask before running `sh …/cachebeat/beat.sh 50 8`. Pick **"Yes, and don't ask again for:
-sh …/beat.sh 50 8"** — not the plain "Yes". The watcher is re-started after every beat, and those
-beats happen precisely when you're *away*; a permission prompt nobody is there to answer would
-silently end the keepalive. That approval matches the exact command, which is why cachebeat re-arms
-with the *identical* command every time (and why a different threshold, e.g. `/cachebeat 40`, asks
-once more). To allow every variant up front, add this to your Claude Code settings instead:
-
-```json
-{ "permissions": { "allow": ["Bash(sh /Users/you/.claude/skills/cachebeat/beat.sh:*)"] } }
-```
-
-Use the absolute path exactly as it appears in the approval prompt — the rule is matched against
-the literal command.
+Requirements: a recent Claude Code (tested on 2.1.288) with hooks enabled — skill-frontmatter hooks and
+`asyncRewake` are standard features, but an organization policy that disables hooks
+(`disableAllHooks`, `allowManagedHooksOnly`) also disables cachebeat.
 
 ## Usage
 
@@ -101,10 +90,16 @@ the literal command.
 /cachebeat stop       # stop it
 ```
 
+You can also just ask Claude ("keep the cache warm while this trains") — it invokes the skill for you.
+
 ## Verifying it's working
 
 You don't have to take it on faith — you can watch the cache stay warm.
 
+- **The heartbeat itself.** When a beat fires you'll see a `⏺ cachebeat heartbeat` line and Claude
+  answering `.` — proof the timer is alive and resetting the TTL. If instead Claude tells you
+  cachebeat stopped itself, the beat fired on schedule but the cache had *still* expired: your
+  session's TTL is too short for any heartbeat to bridge.
 - **The status line.** Claude Code's token readout looks like `tok:312.0k/0.0k` — *total / served
   from cache*. When you return to an idle session, the second number should be a large fraction of
   the first (warm). If it reads `…/0.0k`, the whole context was re-read uncached — the cache had
@@ -120,93 +115,101 @@ You don't have to take it on faith — you can watch the cache stay warm.
 
   A **warm** turn shows a big `cache_read` and a tiny `cache_creation`. A **cold** turn is the
   reverse — a large `cache_creation` means the context was rebuilt from scratch at full price.
-- **The heartbeat itself.** When a beat fires you'll see the `cachebeat keepalive` task finish and
-  Claude quietly start it again, answering with just `.` — proof the watcher is alive and resetting
-  the TTL. If instead Claude tells you a beat came back uncached (the watcher exited `4`), the beat
-  fired on schedule but the cache had *still* died: your session's TTL is too short for any
-  heartbeat to bridge, and it stops on its own.
 
 ## How it works
 
-Claude Code writes every exchange to a session transcript (`~/.claude/projects/<slug>/<session-id>.jsonl`).
-The skill starts [`beat.sh`](beat.sh) as one **background shell task** (Bash with
-`run_in_background`). Every 30 seconds it checks **when the last real turn happened** and how long
-ago that was. It prints nothing while it waits; it exits only when there's something to say — and a
-background task's exit is what wakes Claude. The heart of it:
+The skill's frontmatter declares a **Stop hook** with `asyncRewake: true`. Claude Code registers it when
+you invoke `/cachebeat`, and from then on runs [`beat.sh`](beat.sh) **in the background at the end of
+every turn**. Each run is one inactivity timer. If the hook exits with code 2, Claude Code wakes Claude
+and shows it what the hook printed:
+
+1. A turn ends → the Stop hook starts a timer (and any older timer notices and exits).
+2. Every 30 s the timer checks **when the last real model response was written** to the session
+   transcript (`~/.claude/projects/<slug>/<session-id>.jsonl`). A new response resets the clock.
+3. After N idle minutes it prints a one-line heartbeat note and exits 2 → Claude wakes, reads the
+   conversation from cache (that read *is* the heartbeat), and answers `.`.
+4. That reply ends a turn → step 1. Claude never re-arms anything.
+
+The heart of it:
 
 ```bash
-PREV=__init__; LAST=$(date +%s)
-while [ "$(date +%s)" -lt "$END" ]; do
+while :; do
   sleep 30
-  # Activity signal = timestamp of the last transcript line. It changes only on a
-  # real turn — a bare file-mtime bump (recap rewrite, atomic save) does NOT fool it.
-  SIG=$(tail -n 1 "$F" | grep -oE '"timestamp":"[^"]+"' | tail -1)
-  [ -z "$SIG" ] && SIG=$(wc -c < "$F")
-  [ "$SIG" != "$PREV" ] && { PREV="$SIG"; LAST=$(date +%s); }   # new turn -> reset clock
-  IDLE=$(( $(date +%s) - LAST ))
-  [ "$IDLE" -ge $(( MINUTES*60 )) ] && exit 0    # exit wakes Claude -> cache refreshed -> re-arm
+  [ "$(cat "$S.pid")" = $$ ] || exit 0                  # a newer turn started a newer timer
+  SIG=$(sig "$(last_resp)")                             # the last real model response
+  [ "$SIG" != "$PREV" ] && { PREV=$SIG; LAST=$NOW; }    # new request -> reset the clock
+  IDLE=$((NOW - LAST))
+  [ "$IDLE" -ge $((N*60)) ] && { echo "idle heartbeat …" >&2; exit 2; }   # exit 2 wakes Claude
 done
-exit 3                                           # auto-stop deadline reached
 ```
-
-The **exit code is the whole message**, so Claude never has to read anything back:
 
 | exit | meaning | what Claude does |
 |---|---|---|
-| `0` | beat — the session sat idle for the threshold | re-runs the identical command, replies `.` |
-| `3` | auto-stop deadline reached | tells you it's off |
-| `4` | the last beat *still* came back uncached — TTL too short to bridge | tells you, stops |
-| `5` | couldn't store the deadline (unwritable temp dir) | tells you, stops |
+| `0` | nothing to say: not armed, stopped, superseded, or the cache is already cold | nothing — no wake-up |
+| `2` + "idle heartbeat" | the session sat idle for the threshold | replies `.` (the reply's turn starts the next timer) |
+| `2` + "stopped itself" | the last beat *still* came back uncached — TTL too short to bridge | tells you, stays off |
+| `2` + "auto-stop" | the deadline passed | tells you, stays off |
 
-On a beat, the wake-up turn itself re-reads the conversation at cached price — that read is the
-heartbeat. The skill instructs Claude to do exactly one thing in that turn: start the watcher again
-and answer with a single `.`, because every extra token gets re-read by all future requests. The
-auto-stop deadline is fixed on the first arm and kept in a small state file
-(`$TMPDIR/cachebeat-<session-id>.end`), so re-arming can never extend it. A beat also leaves a
-marker there; a start that finds a fresh marker knows it is that beat's re-arm, keeps the deadline,
-and checks the usage record of the beat that just woke Claude: a large `cache_creation` means the
-cache had already died, and it exits `4` instead of pretending to help.
+Details that keep it honest:
 
-> **Why a script file, and why is the re-arm the identical command?** The watcher is restarted
-> after every beat. A one-line `sh beat.sh 50 8` costs a few dozen output tokens per beat instead of
-> ~600 and keeps the long command out of the context every later request re-reads. And Claude
-> Code's "don't ask again" approval matches the *literal* command: an inline script full of `$(…)`
-> isn't offered that option at all, and even one extra argument on the re-arm would count as a new
-> command — prompting you exactly when you're not there. One unchanging command, one approval.
+- **Arguments without a tool call.** The hook reads them from the newest `/cachebeat` in the transcript
+  (typed, or Claude's own Skill call) and keeps them, with the auto-stop deadline, in
+  `$TMPDIR/cachebeat-<session-id>`. Invoking `/cachebeat` again re-arms with the new values; `/cachebeat
+  stop` disarms. The match is on raw JSON structure, so a transcript that merely *quotes* those lines
+  (say, while debugging cachebeat) can't arm it.
+- **Only real requests count as activity.** Claude Code also appends lines without any model request —
+  `queue-operation` entries when a Workflow's agents finish background commands, `mode`,
+  `away_summary`, its own `"model":"<synthetic>"` notices for usage limits and API errors. Those don't
+  refresh the cache, so they don't reset the clock (they used to, and a busy Workflow could keep the
+  old watcher from ever firing while the cache died).
+- **Never mid-tool.** While a tool is still running (or waiting on a permission prompt), the timer
+  doesn't fire: a wake-up couldn't be delivered before the tool returns anyway.
+- **Every beat is audited.** After a beat, the next timer reads that beat's own usage record. A large
+  `cache_creation` (or 5-minute-TTL cache writes) means the cache had already expired, so it stops
+  and tells you instead of pretending to help.
+- **No beat into a cold cache.** If the machine slept past the TTL, the cache is already gone and a beat
+  would only pay to rebuild it — the timer stands down until you're back.
+- **No beat into the wrong conversation.** A wake-up goes to the Claude Code process, not to a session,
+  so the skill also registers a `SessionEnd` hook: `/clear`, `/resume` and exit disarm the timer before
+  it can beat into the next conversation. If Claude Code dies outright, the timer notices its parent is
+  gone and exits.
+- **The hook's `timeout` matters.** Claude Code kills an `asyncRewake` hook at its `timeout` — 10 minutes
+  unless set — so the skill sets `timeout: 90000` (25 h, past the longest deadline). Without it every
+  timer would die before a 50-minute beat, which is the old failure all over again.
+- **Nothing on stderr but the note.** On exit 2, Claude sees everything the hook wrote to stderr; the
+  script sends all other stderr to `/dev/null` so stray errors can't leak into the conversation.
 
-> **Why a shell task instead of a monitor?** Claude Code kills every Monitor after at most 30
-> minutes, and each expiry wakes Claude — so a monitor-based keepalive is forced into a ~28-minute
-> metronome that beats even while you're actively chatting. A background shell task has no lifetime
-> cap, so the watcher can sit silent for the whole idle threshold and beat only when it's needed:
-> roughly half the beats on a fully idle session, and **zero** on an active one.
-
-> **Why the timestamp, not the file mtime?** The mtime of a `.jsonl` advances whenever Claude Code
-> rewrites the file for its own reasons (recap regeneration, atomic saves) — no turn, no cache
-> refresh. Measuring idle from mtime therefore *undercounts* idle time and fires the beat late,
-> past the TTL, so the beat lands as a full-price uncached re-read: the exact failure this is meant
-> to prevent. The last line's `timestamp` only moves on a genuine turn, so it can't be fooled.
+> **Why a hook, and not a background command, a monitor, or a cron job?** The wake-up needs something
+> that can stay silent for ~50 minutes and then make Claude take a turn:
+>
+> | mechanism | lifetime | why not |
+> |---|---|---|
+> | Monitor | ≤ 30 min | every expiry wakes Claude: forced ~28-min metronome, idle or not |
+> | background Bash (`run_in_background`) | 30 min default, 2 h max (since 2.1.285) | killed before a 50-min beat unless re-armed with `timeout`; at the 2 h cap Claude is told not to restart it |
+> | CronCreate | 7 days | wall-clock metronome; under 60 min apart means ≥ 2 beats an hour, +10% jitter, even while you're chatting |
+> | **Stop hook + `asyncRewake`** | hook's own `timeout` (we set 25 h) | — re-armed by Claude Code itself on every turn end; no tool call, no permission prompt |
 
 ## Compatibility
 
-Linux, WSL2, and macOS. The watcher uses only portable tools — `tail`, `grep`, `wc`, `date +%s` —
-with no `stat` and no timestamp parsing, so there are no GNU-vs-BSD differences to trip over.
-Native Windows (non-WSL) is untested — the watcher assumes a POSIX shell.
+Linux, WSL2, and macOS. The watcher uses only portable tools — `tail`, `grep`, `sed`, `cut`, `tr`,
+`date +%s` — with no `stat`, no `jq` and no timestamp parsing, so there are no GNU-vs-BSD differences to
+trip over (tested with bash-as-`sh`, dash and ksh). Native Windows (non-WSL) is untested — the watcher
+assumes a POSIX shell.
 
-It reads Claude Code's session transcript at `~/.claude/projects/<slug>/<session-id>.jsonl` (found
-via `$CLAUDE_CODE_SESSION_ID`, else the newest transcript in the folder) — the default layout, but
-an internal one rather than a documented API, so a future Claude Code change could require an update
-here.
+It reads Claude Code's session transcript (the path comes from the hook's input) — an internal format
+rather than a documented API, so a future Claude Code change could require an update here.
 
 ## Honest caveats
 
-- **Only helps on sessions with the long (1-hour) cache TTL.** Some sessions run a 5-minute TTL;
-  no practical heartbeat can bridge that. If your bills stay uncached despite beats, stop it.
-- Each beat costs two small cached-read requests (the wake-up and the re-arm) plus a few output
-  tokens, and each beat's exchange is appended to the context that later requests re-read. Cheap,
-  not free.
-- Under **critical memory pressure** Claude Code may reap background shells in a long-idle session.
-  The skill tells Claude to re-arm if the watcher dies unexpectedly, but on a machine that's
-  swapping hard, a beat can be missed.
+- **Only helps on sessions with the long (1-hour) cache TTL.** Some sessions run a 5-minute TTL; no
+  practical heartbeat can bridge that. cachebeat detects it on the first beat and stops itself.
+- Each beat costs one small cached-read request plus a few output tokens, and each beat's exchange is
+  appended to the context that later requests re-read. Cheap, not free.
+- **Resuming a session** (`claude --resume`) doesn't bring the hook back — run `/cachebeat` again.
+- If a beat's own request fails (API error, usage limit), the timer is not restarted until your next
+  message — nothing can warm the cache while requests fail anyway.
+- A wake-up can't be delivered while a long *foreground* tool is running (e.g. a subagent Claude is
+  waiting on); if that takes over an hour, the cache expires regardless.
 - The idle threshold must stay **under** the TTL — the default 50 min leaves ~10 min of margin
   against the 1-hour TTL.
 - If you're *not* coming back to the session, any heartbeat is pure waste. That's what the
