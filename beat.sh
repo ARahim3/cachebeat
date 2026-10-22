@@ -84,7 +84,9 @@ PREV=$(sig "$(last_resp)"); LAST=$(date +%s)
 while :; do
   sleep "$TICK"
   [ "$(cat "$S.pid")" = $$ ] || { log "superseded"; exit 0; }
-  kill -0 "$PPID" || { log "Claude Code is gone"; exit 0; }
+  # Git Bash started by a native Windows process (Claude Code is Node) sees PPID=1, which MSYS cannot
+  # signal: checking it there made every timer quit on its first tick. SessionEnd + the deadline cover it.
+  [ "$PPID" = 1 ] || kill -0 "$PPID" || { log "Claude Code is gone"; exit 0; }
   { read -r ID2 N END _; } < "$S"
   [ "$ID2" = "$ID" ] || { log "re-armed or stopped"; exit 0; }
   case "$N$END" in ''|*[!0-9]*) log "stopped"; exit 0 ;; esac
